@@ -5,20 +5,44 @@ import cron from "node-cron";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is missing");
 
-const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID;
 const TZ = process.env.TZ || "Asia/Seoul";
-const MEETING_TIME = "21:00"; // uchrashuv boshlanish vaqti
-const AUTO_SUMMARY_AFTER_MS = 5 * 60 * 1000; // 5 daqiqa
+
+// Если хочешь расписание только для одной группы:
+const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID
+  ? Number(process.env.GROUP_CHAT_ID)
+  : null;
+
+const MEETING_TIME = "21:00"; // boshlanish vaqti
+const SESSION_MS = 15 * 60 * 1000; // 15 minut
 
 const bot = new Telegraf(BOT_TOKEN);
 
-/* ================== STATE (xotirada) ================== */
+/* ================== STATE (per chat) ================== */
 type Answer = "yes" | "no";
 type UserAnswer = { answer: Answer; name: string };
 
-let answers = new Map<number, UserAnswer>();
-let sessionActive = false;
-let autoSummaryTimer: NodeJS.Timeout | null = null;
+type Session = {
+  active: boolean;
+  answers: Map<number, UserAnswer>; // userId -> {answer, name} (ALOHIDA har bir guruh uchun)
+  closeTimer: NodeJS.Timeout | null;
+  messageId: number | null; // savol yuborilgan xabar id (edit qilish uchun)
+};
+
+const sessions = new Map<number, Session>();
+
+function getSession(chatId: number): Session {
+  let s = sessions.get(chatId);
+  if (!s) {
+    s = {
+      active: false,
+      answers: new Map(),
+      closeTimer: null,
+      messageId: null,
+    };
+    sessions.set(chatId, s);
+  }
+  return s;
+}
 
 /* ================== HELPERS ================== */
 function userDisplayName(from: {
@@ -45,11 +69,13 @@ function formatUserList(list: string[]) {
   );
 }
 
-function buildResultsText() {
+function buildResultsText(chatId: number) {
+  const s = getSession(chatId);
+
   const yesNames: string[] = [];
   const noNames: string[] = [];
 
-  for (const v of answers.values()) {
+  for (const v of s.answers.values()) {
     if (v.answer === "yes") yesNames.push(v.name);
     else noNames.push(v.name);
   }
@@ -71,56 +97,87 @@ function buildResultsText() {
   );
 }
 
-function buildShortResult() {
-  const yes = [...answers.values()].filter((x) => x.answer === "yes").length;
-  const no = [...answers.values()].filter((x) => x.answer === "no").length;
-  return `✅ Tayyor: ${yes} | ❌ Tayyor emas: ${no} | Jami: ${yes + no}`;
+function buildShortResult(chatId: number) {
+  const s = getSession(chatId);
+  let yes = 0,
+    no = 0;
+  for (const v of s.answers.values()) {
+    if (v.answer === "yes") yes++;
+    else no++;
+  }
+  return `✅ ${yes} | ❌ ${no} | Jami ${yes + no}`;
 }
 
-async function sendMeetingQuestion(chatId: string | number) {
-  answers.clear();
-  sessionActive = true;
+function keyboard(active: boolean) {
+  if (!active) return Markup.inlineKeyboard([]);
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("✅ Tayyor", "MEET_YES"),
+      Markup.button.callback("❌ Tayyor emas", "MEET_NO"),
+    ],
+    [
+      Markup.button.callback("🔄 Bekor qilish", "MEET_CANCEL"),
+      Markup.button.callback("📊 Natija", "MEET_RESULT"),
+    ],
+  ]);
+}
 
-  // eski timer bo‘lsa o‘chirib qo‘yamiz
-  if (autoSummaryTimer) clearTimeout(autoSummaryTimer);
+/* ================== SESSION CONTROL ================== */
+async function closeSession(chatId: number) {
+  const s = getSession(chatId);
+  if (!s.active) return;
 
-  await bot.telegram.sendMessage(
+  s.active = false;
+  if (s.closeTimer) clearTimeout(s.closeTimer);
+  s.closeTimer = null;
+
+  const text = `⛔ Session tugadi (15 minut o‘tdi).\n\n${buildResultsText(chatId)}`;
+
+  // убираем кнопки через edit
+  if (s.messageId) {
+    try {
+      await bot.telegram.editMessageText(chatId, s.messageId, undefined, text, {
+        reply_markup: keyboard(false).reply_markup,
+      });
+      return;
+    } catch {
+      // если edit не сработал — просто отправим новый итог
+    }
+  }
+
+  await bot.telegram.sendMessage(chatId, text);
+}
+
+async function startSession(chatId: number) {
+  const s = getSession(chatId);
+
+  // если уже была активная — закрываем старую и начинаем новую
+  if (s.active) await closeSession(chatId);
+
+  s.answers.clear();
+  s.active = true;
+
+  const msg: any = await bot.telegram.sendMessage(
     chatId,
     "🕘 Uchrashuvga 10 daqiqa qoldi.\nTayyormisiz?",
-    Markup.inlineKeyboard([
-      [
-        Markup.button.callback("✅ Tayyor", "MEET_YES"),
-        Markup.button.callback("❌ Tayyor emas", "MEET_NO"),
-      ],
-      [
-        Markup.button.callback("🔄 Ovozini bekor qilish", "MEET_CANCEL"),
-        Markup.button.callback("📊 Natija", "MEET_RESULT"),
-      ],
-    ]),
+    keyboard(true),
   );
 
-  // 5 daqiqadan keyin avtomatik natija
-  autoSummaryTimer = setTimeout(async () => {
-    try {
-      if (!sessionActive) return;
-      await bot.telegram.sendMessage(
-        chatId,
-        `⏱ 5 daqiqa o‘tdi.\n${buildShortResult()}\n\n/results — to‘liq ro‘yxat`,
-      );
-    } catch (err) {
-      console.error("Auto summary error:", err);
-    }
-  }, AUTO_SUMMARY_AFTER_MS);
+  s.messageId = msg?.message_id ?? null;
+
+  if (s.closeTimer) clearTimeout(s.closeTimer);
+  s.closeTimer = setTimeout(() => {
+    void closeSession(chatId);
+  }, SESSION_MS);
 }
 
 /* ================== COMMANDS ================== */
 bot.start(async (ctx) => {
   await ctx.reply(
-    "Salom! Tayyorvoy xizmatinizda!👋\n\n" +
+    "Salom! Meeting Ready Bot ishlayapti 👋\n\n" +
       "/where — chat ID\n" +
-      "/ready — savolni hozir tashlash\n" +
-      "/results — natija + ismlar\n" +
-      "/stop — sessionni yopish (ixtiyoriy)",
+      "/ready — sessionni hozir boshlash\n" +
+      "/results — natija + ismlar (faqat shu guruh uchun)\n",
   );
 });
 
@@ -129,75 +186,79 @@ bot.command("where", async (ctx) => {
 });
 
 bot.command("ready", async (ctx) => {
-  await sendMeetingQuestion(ctx.chat.id);
+  if (ctx.chat.type === "private")
+    return ctx.reply("Bu buyruq faqat guruhda ishlaydi.");
+  await startSession(ctx.chat.id);
 });
 
 bot.command("results", async (ctx) => {
-  if (!sessionActive) {
-    await ctx.reply("Hozir aktiv savol yo‘q.");
-    return;
-  }
-  await ctx.reply(buildResultsText());
-});
+  if (ctx.chat.type === "private")
+    return ctx.reply("Bu buyruq faqat guruhda ishlaydi.");
 
-bot.command("stop", async (ctx) => {
-  sessionActive = false;
-  answers.clear();
-  if (autoSummaryTimer) clearTimeout(autoSummaryTimer);
-  autoSummaryTimer = null;
-  await ctx.reply("✅ Session yopildi.");
+  const s = getSession(ctx.chat.id);
+  if (!s.active) return ctx.reply("Hozir aktiv session yo‘q.");
+
+  await ctx.reply(buildResultsText(ctx.chat.id));
 });
 
 /* ================== BUTTONS ================== */
 bot.action("MEET_YES", async (ctx) => {
   if (!ctx.from) return;
-  if (!sessionActive) return ctx.answerCbQuery("Hozir aktiv savol yo‘q.");
+  const chatId = ctx.chat?.id;
+  if (typeof chatId !== "number") return;
+
+  const s = getSession(chatId);
+  if (!s.active) return ctx.answerCbQuery("Session tugagan.");
 
   const name = userDisplayName(ctx.from);
-  answers.set(ctx.from.id, { answer: "yes", name });
+  s.answers.set(ctx.from.id, { answer: "yes", name });
 
   await ctx.answerCbQuery("✅ Qabul qilindi");
 });
 
 bot.action("MEET_NO", async (ctx) => {
   if (!ctx.from) return;
-  if (!sessionActive) return ctx.answerCbQuery("Hozir aktiv savol yo‘q.");
+  const chatId = ctx.chat?.id;
+  if (typeof chatId !== "number") return;
+
+  const s = getSession(chatId);
+  if (!s.active) return ctx.answerCbQuery("Session tugagan.");
 
   const name = userDisplayName(ctx.from);
-  answers.set(ctx.from.id, { answer: "no", name });
+  s.answers.set(ctx.from.id, { answer: "no", name });
 
   await ctx.answerCbQuery("❌ Qabul qilindi");
 });
 
-bot.action("MEET_RESULT", async (ctx) => {
-  if (!sessionActive) return ctx.answerCbQuery("Natija yo‘q.");
-  await ctx.answerCbQuery(buildShortResult());
-});
-
 bot.action("MEET_CANCEL", async (ctx) => {
   if (!ctx.from) return;
+  const chatId = ctx.chat?.id;
+  if (typeof chatId !== "number") return;
 
-  if (!sessionActive) {
-    await ctx.answerCbQuery("Hozir aktiv savol yo‘q.");
-    return;
-  }
+  const s = getSession(chatId);
+  if (!s.active) return ctx.answerCbQuery("Session tugagan.");
 
-  if (!answers.has(ctx.from.id)) {
-    await ctx.answerCbQuery("Siz hali ovoz bermagansiz.");
-    return;
-  }
+  if (!s.answers.has(ctx.from.id))
+    return ctx.answerCbQuery("Siz hali ovoz bermagansiz.");
+  s.answers.delete(ctx.from.id);
 
-  answers.delete(ctx.from.id);
-  await ctx.answerCbQuery("🔄 Ovoz bekor qilindi");
+  await ctx.answerCbQuery("🔄 Bekor qilindi");
 });
 
-/* ================== SCHEDULE ==================
-   Tue(2), Thu(4), Sat(6)
-   21:00 dan 10 daqiqa oldin => 20:50
-================================================ */
+bot.action("MEET_RESULT", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (typeof chatId !== "number") return;
+
+  const s = getSession(chatId);
+  if (!s.active) return ctx.answerCbQuery("Session tugagan.");
+
+  await ctx.answerCbQuery(buildShortResult(chatId));
+});
+
+/* ================== SCHEDULE (1 group from env) ================== */
 function setupSchedule() {
   if (!GROUP_CHAT_ID) {
-    console.log("GROUP_CHAT_ID yo‘q. /where orqali oling va .env ga yozing");
+    console.log("GROUP_CHAT_ID yo‘q — cron faqat /ready bilan ishlaydi");
     return;
   }
 
@@ -208,15 +269,13 @@ function setupSchedule() {
   const sendMinute = (totalMinutes + 1440) % 60;
 
   const cronExpr = `${sendMinute} ${sendHour} * * 2,4,6`; // Tue,Thu,Sat
-  // const cronExpr = "*/1 * * * *"; // test uchun: har minut
-
-  console.log("Schedule:", cronExpr, "TZ:", TZ);
+  console.log("Schedule:", cronExpr, "TZ:", TZ, "CHAT:", GROUP_CHAT_ID);
 
   cron.schedule(
     cronExpr,
     async () => {
       try {
-        await sendMeetingQuestion(GROUP_CHAT_ID);
+        await startSession(GROUP_CHAT_ID);
       } catch (err) {
         console.error("Schedule error:", err);
       }
