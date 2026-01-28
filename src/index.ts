@@ -88,9 +88,14 @@ async function sendMeetingQuestion(chatId: string | number) {
     chatId,
     "🕘 Uchrashuvga 10 daqiqa qoldi.\nTayyormisiz?",
     Markup.inlineKeyboard([
-      Markup.button.callback("✅ Tayyor", "MEET_YES"),
-      Markup.button.callback("❌ Tayyor emas", "MEET_NO"),
-      Markup.button.callback("📊 Natija", "MEET_RESULT"),
+      [
+        Markup.button.callback("✅ Tayyor", "MEET_YES"),
+        Markup.button.callback("❌ Tayyor emas", "MEET_NO"),
+      ],
+      [
+        Markup.button.callback("🔄 Ovozini bekor qilish", "MEET_CANCEL"),
+        Markup.button.callback("📊 Natija", "MEET_RESULT"),
+      ],
     ]),
   );
 
@@ -167,6 +172,23 @@ bot.action("MEET_NO", async (ctx) => {
 bot.action("MEET_RESULT", async (ctx) => {
   if (!sessionActive) return ctx.answerCbQuery("Natija yo‘q.");
   await ctx.answerCbQuery(buildShortResult());
+});
+
+bot.action("MEET_CANCEL", async (ctx) => {
+  if (!ctx.from) return;
+
+  if (!sessionActive) {
+    await ctx.answerCbQuery("Hozir aktiv savol yo‘q.");
+    return;
+  }
+
+  if (!answers.has(ctx.from.id)) {
+    await ctx.answerCbQuery("Siz hali ovoz bermagansiz.");
+    return;
+  }
+
+  answers.delete(ctx.from.id);
+  await ctx.answerCbQuery("🔄 Ovoz bekor qilindi");
 });
 
 /* ================== SCHEDULE ==================
