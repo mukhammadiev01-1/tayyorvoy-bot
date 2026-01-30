@@ -262,22 +262,34 @@ function setupSchedule() {
     return;
   }
 
-  const [hh, mm] = MEETING_TIME.split(":").map(Number);
-  const totalMinutes = hh * 60 + mm - 10;
+  // ВТ, СР, ЧТ, ПТ, СБ → 20:50 (за 10 мин до 21:00)
+  const weekdayCron = "50 20 * * 2-6";
 
-  const sendHour = Math.floor(((totalMinutes + 1440) % 1440) / 60);
-  const sendMinute = (totalMinutes + 1440) % 60;
+  // ВОСКРЕСЕНЬЕ → 19:20 (за 10 мин до 19:30)
+  const sundayCron = "20 19 * * 0";
 
-  const cronExpr = `${sendMinute} ${sendHour} * * 2,4,6`; // Tue,Thu,Sat
-  console.log("Schedule:", cronExpr, "TZ:", TZ, "CHAT:", GROUP_CHAT_ID);
+  console.log("Schedule weekday:", weekdayCron, "TZ:", TZ);
+  console.log("Schedule sunday:", sundayCron, "TZ:", TZ);
 
   cron.schedule(
-    cronExpr,
+    weekdayCron,
     async () => {
       try {
         await startSession(GROUP_CHAT_ID);
       } catch (err) {
-        console.error("Schedule error:", err);
+        console.error("Weekday schedule error:", err);
+      }
+    },
+    { timezone: TZ },
+  );
+
+  cron.schedule(
+    sundayCron,
+    async () => {
+      try {
+        await startSession(GROUP_CHAT_ID);
+      } catch (err) {
+        console.error("Sunday schedule error:", err);
       }
     },
     { timezone: TZ },
